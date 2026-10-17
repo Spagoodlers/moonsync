@@ -11,11 +11,12 @@ import sqlite3
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import testpaths  # noqa: E402
 from moonsync import core  # noqa: E402
 
-LIB = sys.argv[1] if len(sys.argv) > 1 else r'F:\books\calibrelibrary'
-MOON = sys.argv[2] if len(sys.argv) > 2 else os.path.expanduser(r'~\Documents\Dropbox\Apps\Books\.Moon+\Cache')
+LIB = testpaths.library()
+MOON = testpaths.moon_folder()
 
 tmp = tempfile.mkdtemp()
 annots_dir = os.path.join(tmp, 'annots')
