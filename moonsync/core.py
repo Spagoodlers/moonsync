@@ -12,16 +12,19 @@ Moon+ .po format (reverse engineered, there is no public spec):
 stamp    13 digit millisecond epoch. It is shared by many books so it seems to
          identify the device/installation rather than the save time. We
          preserve whatever value is already in use.
-chapter  Moon+ "chapter" index. Usually the spine index, but Moon+ splits
-         large HTML files at their table of contents anchors, so for those
-         books every TOC section in a big file counts as its own chapter.
+chapter  Moon+ "chapter" index. A spine file is split into several chapters
+         at its table of contents anchors, see Book.chapters().
 sub      Always 0 in observed files.
-offset   Character offset into the chapter's body text.
-percent  Progress shown to the user, used here only to validate a mapping.
+offset   Character offset into the chapter's body text. Font size and screen
+         do not change it, but Moon+ saves the top of the page on screen.
+percent  Progress shown to the user. It comes from Moon+'s own layout, so it
+         is only used to rule chapter layouts out.
 '''
 
+import json
 import os
 import re
+import threading
 import time
 from hashlib import sha256
 
@@ -31,12 +34,23 @@ XHTML_NS = 'http://www.w3.org/1999/xhtml'
 BODY = '{%s}body' % XHTML_NS
 PO_PAT = re.compile(r'^\s*(\d+)\*(\d+)@(\d+)#(\d+):([\d.]+)%\s*$')
 UUID_PAT = re.compile(r'_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.epub\.po$', re.I)
-# Files with more body text than this are split at their TOC anchors by Moon+.
-# Fitted against real .po files; see README.
+# Ways Moon+ may divide a book into chapters, most likely first:
+# toc-all    every TOC anchor with text before it starts a chapter
+# toc-split  only files with more than SPLIT_THRESHOLD characters are split
+#            (what older .po files seemed to show)
+# spine      one chapter per spine file
+LAYOUTS = ('toc-all', 'toc-split', 'spine')
 SPLIT_THRESHOLD = 100000
-# A mapping whose percentage disagrees with Moon+ by more than this is
-# rejected and the percentage is used instead.
-MAX_PERCENT_ERROR = 2.0
+# Moon+'s percentage differs from a text based one by up to ~4 points (images,
+# page breaks), while a wrong chapter layout is usually 10+ points out. A
+# layout further out than this is rejected and the percentage used instead.
+MAX_PERCENT_ERROR = 5.0
+# Among layouts within MAX_PERCENT_ERROR, a less likely one is only chosen
+# when it is closer by more than this
+PERCENT_SLACK = 1.0
+# Moon+ saves the top of the page, so a position we wrote comes back moved
+# back by up to a page. Within this many characters it is the same place.
+ECHO_CHARS = 3000
 
 
 class UnknownLayout(ValueError):
@@ -139,14 +153,17 @@ class SpineFile:
     def __init__(self, name, body):
         self.name = name
         self.body = body
-        self.length = 0
+        self.text = ''
         self.anchors = {}
         if body is not None:
-            self.anchors, self.length = anchor_offsets(body)
+            self.anchors, self.text = anchor_offsets(body)
+        self.length = len(self.text)
 
 
 def anchor_offsets(body):
+    '''Text offset of every id/name in body, and body's text.'''
     offsets = {}
+    parts = []
     n = 0
     for ev, el in etree.iterwalk(body, events=('start', 'end')):
         if ev == 'start':
@@ -156,10 +173,12 @@ def anchor_offsets(body):
                     if v and v not in offsets:
                         offsets[v] = n
                 if el.text:
+                    parts.append(el.text)
                     n += len(el.text)
         elif el is not body and el.tail:
+            parts.append(el.tail)
             n += len(el.tail)
-    return offsets, n
+    return offsets, ''.join(parts)
 
 
 class Book:
@@ -178,16 +197,25 @@ class Book:
             if node.dest and node.frag:
                 self.toc_frags.setdefault(node.dest, set()).add(node.frag)
         self._chapters = {}
+        # Changes when the book is edited in a way that can move chapters
+        self.signature = '%d:%d' % (len(self.files), self.total)
 
     def chapters(self, model):
         '''List of (spine_index, start_offset) for each Moon+ chapter.'''
         if model not in self._chapters:
             ans = []
             for i, f in enumerate(self.files):
-                starts = {0}
-                if model == 'toc-split' and f.length > SPLIT_THRESHOLD:
-                    starts |= {f.anchors[x] for x in self.toc_frags.get(f.name, ()) if x in f.anchors}
-                ans.extend((i, s) for s in sorted(starts))
+                frags = sorted({f.anchors[x] for x in self.toc_frags.get(f.name, ()) if x in f.anchors})
+                starts = [0]
+                if model == 'toc-all':
+                    # An anchor with only whitespace before it (often the
+                    # chapter heading at the top of its file) starts nothing
+                    for a in frags:
+                        if a > starts[-1] and f.text[starts[-1]:a].strip():
+                            starts.append(a)
+                elif model == 'toc-split' and f.length > SPLIT_THRESHOLD:
+                    starts = sorted({0} | set(frags))
+                ans.extend((i, s) for s in starts)
             self._chapters[model] = ans
         return self._chapters[model]
 
@@ -203,12 +231,11 @@ class Book:
     def percent(self, spine_index, offset):
         return 100.0 * self.global_offset(spine_index, offset) / self.total
 
-    def moon_to_spine(self, pos):
-        '''Return (spine_index, offset, how) for a Moon+ position. how is the
-        chapter layout used, or "percent" if the position had to be placed
-        from Moon+'s percentage alone.'''
-        found = {}
-        for model in ('spine', 'toc-split'):
+    def candidates(self, pos):
+        '''(layout, spine_index, offset, percent_error) for every layout the
+        position fits into, i.e. its offset is inside that chapter.'''
+        ans = []
+        for model in LAYOUTS:
             chapters = self.chapters(model)
             if pos.chapter >= len(chapters):
                 continue
@@ -216,36 +243,34 @@ class Book:
             nxt = chapters[pos.chapter + 1] if pos.chapter + 1 < len(chapters) else None
             end = nxt[1] if nxt and nxt[0] == idx else self.files[idx].length
             if start + pos.offset > end:
-                continue  # offset does not fit, so this is not Moon+'s chapter layout
+                continue
             off = start + pos.offset
-            found[model] = (abs(self.percent(idx, off) - pos.percent), idx, off)
-        if found:
-            # Moon+'s percentage is only loosely related to text position, so
-            # it just picks between layouts that both fit.
-            model = min(found, key=lambda m: found[m][0])
-            err, idx, off = found[model]
-            if len(found) == 2 and found['spine'][1:] == found['toc-split'][1:]:
-                model = 'toc-split'
-            if err <= MAX_PERCENT_ERROR or not self.size_split_suspected(idx):
-                return idx, off, model
+            ans.append((model, idx, off, abs(self.percent(idx, off) - pos.percent)))
+        return ans
+
+    def plausible_layouts(self, pos):
+        return [c[0] for c in self.candidates(pos) if c[3] <= MAX_PERCENT_ERROR]
+
+    def moon_to_spine(self, pos, known=None):
+        '''Return (spine_index, offset, how) for a Moon+ position. how is the
+        chapter layout used, or "percent" if the position had to be placed
+        from Moon+'s percentage alone. known: layouts that earlier positions
+        for this book were consistent with.'''
+        cands = [c for c in self.candidates(pos) if c[3] <= MAX_PERCENT_ERROR]
+        if cands:
+            best = min(c[3] for c in cands)
+            model, idx, off, err = min(cands, key=lambda c: (
+                bool(known) and c[0] not in known, c[3] > best + PERCENT_SLACK, LAYOUTS.index(c[0])))
+            return idx, off, model
         idx, off = self.from_global(int(self.total * pos.percent / 100.0))
         return idx, off, 'percent'
 
-    def size_split_suspected(self, spine_index):
-        '''Moon+ also seems to split huge files that have no TOC anchors, by
-        size, in a way not yet worked out. Chapter numbers after such a file
-        cannot be trusted.'''
-        for f in self.files[:spine_index + 1]:
-            if f.length > SPLIT_THRESHOLD and not any(x in f.anchors for x in self.toc_frags.get(f.name, ())):
-                return True
-        return False
-
-    def detect_model(self, pos):
+    def detect_model(self, pos, known=None):
         '''Which chapter layout Moon+ uses for this book, judged from an
         existing Moon+ position. None if that position fits no known layout.'''
         if pos is None:
-            return 'toc-split'  # nothing to check against, best guess
-        idx, off, how = self.moon_to_spine(pos)
+            return (known or LAYOUTS)[0]  # nothing to check against
+        idx, off, how = self.moon_to_spine(pos, known)
         return None if how == 'percent' else how
 
     def spine_to_moon(self, spine_index, offset, model, stamp):
@@ -467,14 +492,103 @@ def _stamp(t):
     return time.strftime('%H:%M:%S', time.localtime(t)) if t else 'never'
 
 
+# What the plugin knows per .po file, kept in STATE_PATH (set by the GUI):
+#   wrote    the position we last wrote, to tell our writes from Moon+'s
+#   model    the chapter layout that write used
+#   layouts  {stamp: [layouts]}: the layouts every position Moon+ (on the
+#            device with that stamp) has written is consistent with
+#   book     Book.signature the layouts were learned on
+STATE_PATH = None
+_state_lock = threading.Lock()
+
+
+def _read_state():
+    try:
+        with open(STATE_PATH, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def po_state(po_path):
+    if STATE_PATH is None or not po_path:
+        return {}
+    with _state_lock:
+        return _read_state().get(os.path.basename(po_path), {})
+
+
+def _update_po_state(po_path, **changes):
+    if STATE_PATH is None:
+        return
+    with _state_lock:
+        state = _read_state()
+        state.setdefault(os.path.basename(po_path), {}).update(changes)
+        tmp = STATE_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(state, f, indent=1, sort_keys=True)
+        os.replace(tmp, STATE_PATH)
+
+
+def known_layouts(book, po_path, stamp):
+    st = po_state(po_path)
+    if st.get('book') != book.signature:
+        return None  # never seen, or the book changed since
+    return st.get('layouts', {}).get(stamp)
+
+
+def learn_layouts(book, po_path, pos):
+    '''Narrow down the layouts Moon+ uses for this book from a position it
+    wrote. Positions near chapter starts fit several layouts, so each one
+    only rules some out.'''
+    cands = book.candidates(pos)
+    if any(c[3] < 0.05 for c in cands):
+        # Moon+'s own percentage is practically never exactly ours, so this
+        # was most likely written by an older version of this plugin
+        return
+    fits = [c[0] for c in cands if c[3] <= MAX_PERCENT_ERROR]
+    if not fits:
+        return
+    st = po_state(po_path)
+    layouts = st.get('layouts', {}) if st.get('book') == book.signature else {}
+    old = layouts.get(pos.stamp)
+    new = [m for m in LAYOUTS if m in fits and (not old or m in old)] or fits
+    if new != old:
+        layouts[pos.stamp] = new
+        _update_po_state(po_path, layouts=layouts, book=book.signature)
+        log('LEARN', os.path.basename(po_path), 'device', pos.stamp, 'layouts', old, '->', new)
+
+
+def is_ours(po_path, pos):
+    return pos is not None and po_state(po_path).get('wrote') == pos.serialize()
+
+
+def is_echo(po_path, pos):
+    '''True if pos is Moon+ re-saving the position we last wrote: it opens
+    there and saves the top of that page, a little earlier in the chapter.'''
+    w = po_state(po_path).get('wrote')
+    try:
+        w = MoonPosition.parse(w)
+    except (TypeError, ValueError):
+        return False
+    return pos.chapter == w.chapter and 0 < w.offset - pos.offset <= ECHO_CHARS
+
+
 def import_position(book_path, po_path, book=None):
     '''Moon+ -> viewer. Returns (cfi, how).'''
     book = book or Book(book_path)
     pos = read_po(po_path)
-    idx, off, how = book.moon_to_spine(pos)
+    ours = is_ours(po_path, pos)
+    if not ours:
+        learn_layouts(book, po_path, pos)
+    known = known_layouts(book, po_path, pos.stamp)
+    idx, off, how = book.moon_to_spine(pos, known)
     cfi = offset_to_cfi(book, idx, off)
     write_viewer_last_read(book_path, cfi, os.path.getmtime(po_path))
-    log('IMPORT', os.path.basename(po_path), pos.serialize(), '-> spine', idx, 'offset', off, 'via', how, '->', cfi)
+    log('IMPORT', os.path.basename(po_path), pos.serialize(), '(our own)' if ours else '(device %s)' % pos.stamp,
+        '-> spine', idx, 'offset', off, 'via', how, '->', cfi)
+    if how == 'percent':
+        log('  no chapter layout fits, the copy of this book on that device may differ from the library\'s. Fits:',
+            ['%s spine %d +%d %.1f%% off' % c for c in book.candidates(pos)] or 'none')
     return cfi, how
 
 
@@ -492,7 +606,13 @@ def export_position(book_path, po_path, folder, book=None):
             existing = None
     idx, off = cfi_to_offset(book, cfi)
     stamp = existing.stamp if existing else common_stamp(folder)
-    model = book.detect_model(existing)
+    st = po_state(po_path)
+    if is_ours(po_path, existing) and st.get('model') and st.get('book') == book.signature:
+        model = st['model']  # keep writing in the layout we chose before
+    else:
+        if existing is not None:
+            learn_layouts(book, po_path, existing)
+        model = book.detect_model(existing, known_layouts(book, po_path, stamp))
     if model is None:
         raise UnknownLayout('Cannot work out how Moon+ divides this book into chapters')
     pos = book.spine_to_moon(idx, off, model, stamp)
@@ -500,7 +620,12 @@ def export_position(book_path, po_path, folder, book=None):
         log('EXPORT unchanged', os.path.basename(po_path), pos.serialize(), 'viewer', cfi)
         return None  # unchanged; don't make Dropbox upload it again
     write_po(po_path, pos)
-    log('EXPORT wrote', os.path.basename(po_path), (existing.serialize() if existing else 'new file'), '->', pos.serialize(), 'from viewer', cfi, 'saved', _stamp(ts))
+    changes = {'wrote': pos.serialize(), 'model': model, 'book': book.signature}
+    if po_state(po_path).get('book') != book.signature:
+        changes['layouts'] = {}  # learned on a different version of the book
+    _update_po_state(po_path, **changes)
+    log('EXPORT wrote', os.path.basename(po_path), (existing.serialize() if existing else 'new file'), '->', pos.serialize(),
+        'via', model, 'from viewer', cfi, 'saved', _stamp(ts))
     # Give the file the viewer's timestamp so newer_side() sees them as equal
     os.utime(po_path, (ts, ts))
     return pos
@@ -515,6 +640,20 @@ def newer_side(book_path, po_path):
     log('COMPARE', os.path.basename(po_path or ''), 'moon file', _stamp(mts), '| viewer', _stamp(vts), cfi)
     # Two seconds of slack so a just-synced pair is not bounced back
     if mts > vts + 2:
+        try:
+            pos = read_po(po_path)
+        except Exception:
+            return 'moon'
+        if not cfi:
+            return 'moon'
+        if is_ours(po_path, pos):
+            # Only the time changed, e.g. Dropbox downloaded the file again
+            log('COMPARE moon file is still what we wrote')
+            return None
+        if is_echo(po_path, pos):
+            # Importing it would only move calibre back to the page start
+            log('COMPARE moon file is Moon+ re-saving our position', pos.serialize())
+            return None
         return 'moon'
     if vts > mts + 2:
         return 'viewer'

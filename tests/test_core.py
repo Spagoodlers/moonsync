@@ -57,7 +57,7 @@ for po in sorted(glob.glob(os.path.join(MOON, '*.epub.po'))):
     idx, off, how = b.moon_to_spine(pos)
     cfi = core.offset_to_cfi(b, idx, off)
     idx2, off2 = core.cfi_to_offset(b, cfi)
-    back = b.spine_to_moon(idx2, off2, how if how != 'percent' else 'toc-split', pos.stamp)
+    back = b.spine_to_moon(idx2, off2, how if how != 'percent' else core.LAYOUTS[0], pos.stamp)
     flag = 'OK ' if (how == 'percent' or (back.chapter, back.offset) == (pos.chapter, pos.offset)) else 'BAD'
     text = ''.join(b.files[idx].body.itertext())[off:off + 50].replace('\n', ' ') if b.files[idx].body is not None else ''
     print(flag, '%-32s %-30s %-9s %s | %r' % (title[:32], pos.serialize(), how, back.serialize(), text))

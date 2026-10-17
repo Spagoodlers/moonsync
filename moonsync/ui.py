@@ -115,6 +115,7 @@ class MoonSyncAction(InterfaceAction):
             view.view_format_by_id = view_format_by_id
         from calibre.utils.config import config_dir
         core.LOG_PATH = os.path.join(config_dir, 'plugins', 'moonsync.log')
+        core.STATE_PATH = os.path.join(config_dir, 'plugins', 'moonsync_state.json')
         core.log('---- calibre started, plugin', '.'.join(map(str, self.interface_action_base_plugin.version)),
                  '| folder', self.folder, '| open_all', prefs['open_all'], '| save_all', prefs['save_all'])
         self.annots_mtimes = self.scan_annots()
@@ -187,7 +188,9 @@ class MoonSyncAction(InterfaceAction):
             if not os.path.exists(newest):
                 return 'no Moon+ position'
             cfi, how = core.import_position(path, newest, book=self.books.get(path))
-            return 'Moon+ → calibre' + (' (approximate, from percentage)' if how == 'percent' else '')
+            return 'Moon+ → calibre' + (
+                ' (approximate, from percentage: Moon+\'s chapter numbers do not fit this EPUB, '
+                'the copy on the phone may be a different version)' if how == 'percent' else '')
         if direction == 'viewer':
             results = []
             for po in pos:
