@@ -9,7 +9,7 @@ class MoonSyncPlugin(InterfaceActionBase):
     description = ('Share reading positions between Moon+ Reader (via its '
                    'synced .po files) and the calibre e-book viewer')
     supported_platforms = ['windows', 'osx', 'linux']
-    author = "Matthew 'Spagoodlers' Cossum"
+    author = 'Spagoodlers'
     version = (0, 4, 0)
     minimum_calibre_version = (6, 0, 0)
     actual_plugin = 'calibre_plugins.moonsync.ui:MoonSyncAction'
